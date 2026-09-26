@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from app.edit_plan import PlanSegment, build_edit_plan
+from app.edit_plan import MinRunError, PlanSegment, build_edit_plan
 
 
 def _check_least_squares() -> None:
@@ -26,6 +26,16 @@ def _check_edit_plan() -> None:
     plan = build_edit_plan(segments, 0.0, 150.0, 500.0)
     if [item.seg_id for item in plan.items] != ["a", "b"] or plan.total_cost != 700.0:
         raise SystemExit("[selfcheck] 编辑计划求解器自检失败")
+    # min_run_ms=50 时解不变；60 时 b 的尾段只有 50ms 不达标，无可行计划
+    plan = build_edit_plan(segments, 0.0, 150.0, 500.0, min_run_ms=50.0)
+    if [item.seg_id for item in plan.items] != ["a", "b"] or plan.total_cost != 700.0:
+        raise SystemExit("[selfcheck] 编辑计划最短连续时长自检失败")
+    try:
+        build_edit_plan(segments, 0.0, 150.0, 500.0, min_run_ms=60.0)
+    except MinRunError:
+        pass
+    else:
+        raise SystemExit("[selfcheck] 编辑计划最短连续时长自检失败")
     print("[selfcheck] 编辑计划求解器自检通过")
 
 

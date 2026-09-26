@@ -101,6 +101,11 @@ curl -X POST http://localhost:8000/v1/calibrate \
 
 同价时取逐区间 id 序列字典序最小者。服务只输出计划，不处理音频文件。
 
+请求可附带非负 `min_run_ms`（默认 0）：最终计划（同一片段相邻区间已合并）
+中每段连续使用同一片段 id 的参考时长都不得少于该值，时间窗首尾两段同样
+适用。求解在片段端点构成的半开区间上直接全局搜索满足约束的最低成本方案，
+而不是先求无约束方案再删除短段。
+
 ### 请求示例
 
 ```bash
@@ -129,7 +134,9 @@ curl -X POST http://localhost:8000/v1/edit-plan \
 - `segments[].id`：片段唯一标识字符串，请求内不可重复；
 - `segments[].cost_per_ms`：单位毫秒成本，有限且非负；
 - `window_start_ms` / `window_end_ms`：参考时间窗（统一时间），起点必须小于终点；
-- `switch_cost`：相邻小区间更换片段 id 的单次成本，有限且非负。
+- `switch_cost`：相邻小区间更换片段 id 的单次成本，有限且非负；
+- `min_run_ms`：可选，默认 0；每段连续使用同一片段 id 的最短参考时长
+  （毫秒），有限且非负，时间窗首尾两段同样适用。
 
 ### 成功响应（200）
 
@@ -150,6 +157,43 @@ curl -X POST http://localhost:8000/v1/edit-plan \
 （`start_ms` / `end_ms`）与逆变换后的设备本地起止（`device_start_ms` /
 `device_end_ms`）。`total_cost` 为总成本。
 
+### 最短连续时长示例（`min_run_ms`）
+
+```bash
+curl -X POST http://localhost:8000/v1/edit-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "devices": ["A"],
+    "reference_device": "A",
+    "sync_points": [],
+    "tolerance_ms": 0.5,
+    "segments": [
+      {"id": "a", "device": "A", "start_ms": 0,  "end_ms": 80,  "cost_per_ms": 0.0},
+      {"id": "b", "device": "A", "start_ms": 50, "end_ms": 100, "cost_per_ms": 0.0}
+    ],
+    "window_start_ms": 0,
+    "window_end_ms": 100,
+    "switch_cost": 10.0,
+    "min_run_ms": 50.0
+  }'
+```
+
+无约束时字典序最小的方案是 `a` 用满 `[0, 80)` 再切 `b`（`b` 段仅 20ms）；
+`min_run_ms=50` 要求每段至少 50ms，切换点提前到 50：
+
+```json
+{
+  "reference_device": "A",
+  "window_start_ms": 0.0,
+  "window_end_ms": 100.0,
+  "total_cost": 10.0,
+  "plan": [
+    {"id": "a", "device": "A", "start_ms": 0.0,  "end_ms": 50.0,  "device_start_ms": 0.0,  "device_end_ms": 50.0},
+    {"id": "b", "device": "A", "start_ms": 50.0, "end_ms": 100.0, "device_start_ms": 50.0, "device_end_ms": 100.0}
+  ]
+}
+```
+
 ### 空档响应（422）
 
 窗口内存在没有任何片段完整覆盖的空档时，返回 422 及全部合并后的空档范围
@@ -160,6 +204,20 @@ curl -X POST http://localhost:8000/v1/edit-plan \
   "detail": {
     "message": "窗口内存在无片段覆盖的空档：[200.0, 400.0)",
     "gaps_ms": [{"start_ms": 200.0, "end_ms": 400.0}]
+  }
+}
+```
+
+### 最短时长不可满足响应（422）
+
+覆盖充分但不存在满足 `min_run_ms` 的计划时，同样返回 422，但详情结构
+与空档不同（无 `gaps_ms`，带 `min_run_ms`），可直接区分：
+
+```json
+{
+  "detail": {
+    "message": "覆盖充分，但不存在满足最短连续时长 min_run_ms=150.0 的可行计划",
+    "min_run_ms": 150.0
   }
 }
 ```
@@ -180,7 +238,7 @@ uvicorn app.main:app --reload  # 本地起服务
 app/
   main.py         # FastAPI 入口与请求校验（/v1/calibrate、/v1/edit-plan）
   calibration.py  # NumPy 联合最小二乘标定核心
-  edit_plan.py    # 编辑计划优化：区间划分、空档检测、动态规划求解
+  edit_plan.py    # 编辑计划优化：区间划分、空档检测、最短连续时长约束下的动态规划求解
   models.py       # 请求/响应模型
   selfcheck.py    # 容器启动时的初始化自检（最小二乘 + 编辑计划求解器）
 tests/            # 行为测试
