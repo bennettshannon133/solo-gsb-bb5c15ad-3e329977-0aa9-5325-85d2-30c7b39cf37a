@@ -5,7 +5,12 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .calibration import CalibrationError, SyncPoint, calibrate
-from .edit_plan import GapError, PlanSegment, build_edit_plan
+from .edit_plan import (
+    GapError,
+    MinRunInfeasibleError,
+    PlanSegment,
+    build_edit_plan,
+)
 from .models import (
     CalibrateRequest,
     CalibrateResponse,
@@ -18,7 +23,7 @@ from .models import (
 
 app = FastAPI(
     title="多录音机时钟联合标定服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "对离线采访素材的多台录音机做时钟联合标定：参考设备映射固定为原时间，"
         "其余设备采用正斜率仿射映射，联立全部同步点做最小二乘；并可在标定后的"
@@ -152,6 +157,7 @@ def edit_plan_endpoint(req: EditPlanRequest) -> EditPlanResponse:
             window_start_ms=req.window_start_ms,
             window_end_ms=req.window_end_ms,
             switch_cost=req.switch_cost,
+            min_run_ms=req.min_run_ms,
         )
     except GapError as exc:
         raise HTTPException(
@@ -161,6 +167,15 @@ def edit_plan_endpoint(req: EditPlanRequest) -> EditPlanResponse:
                 "gaps_ms": [
                     {"start_ms": start, "end_ms": end} for start, end in exc.gaps
                 ],
+            },
+        ) from exc
+    except MinRunInfeasibleError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "reason": "min_run_infeasible",
+                "min_run_ms": exc.min_run_ms,
             },
         ) from exc
 

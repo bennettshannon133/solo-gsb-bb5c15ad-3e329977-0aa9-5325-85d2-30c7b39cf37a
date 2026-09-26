@@ -85,6 +85,15 @@ class EditPlanRequest(BaseModel):
     switch_cost: float = Field(
         ..., ge=0.0, allow_inf_nan=False, description="相邻小区间更换片段 id 的单次成本，有限且非负"
     )
+    min_run_ms: float = Field(
+        default=0.0,
+        ge=0.0,
+        allow_inf_nan=False,
+        description=(
+            "每段连续使用同一片段 id 的最小参考时长（毫秒，含时间窗首尾段），"
+            "有限且非负，默认 0 表示不限制"
+        ),
+    )
 
     @field_validator("devices")
     @classmethod

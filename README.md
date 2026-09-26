@@ -99,7 +99,11 @@ curl -X POST http://localhost:8000/v1/calibrate \
 总成本 = Σ(区间时长 × 所选片段 cost_per_ms) + 相邻区间更换片段 id 的次数 × switch_cost
 ```
 
-同价时取逐区间 id 序列字典序最小者。服务只输出计划，不处理音频文件。
+同价时取逐区间 id 序列字典序最小者。可选的 `min_run_ms`（非负，默认 `0`）
+要求最终计划中每段连续使用同一片段 id 的参考时间长度（含时间窗首尾两段）
+都不少于该值：最短时长约束直接在片段端点构成的半开区间上全局求最低成本
+可行方案，而不是先求无约束方案再删除短段。覆盖充分但无满足最短时长的
+方案时返回 422（与空档错误区分，见下文）。服务只输出计划，不处理音频文件。
 
 ### 请求示例
 
@@ -120,7 +124,8 @@ curl -X POST http://localhost:8000/v1/edit-plan \
     ],
     "window_start_ms": 0,
     "window_end_ms": 1500,
-    "switch_cost": 10.0
+    "switch_cost": 10.0,
+    "min_run_ms": 0
   }'
 ```
 
@@ -129,7 +134,9 @@ curl -X POST http://localhost:8000/v1/edit-plan \
 - `segments[].id`：片段唯一标识字符串，请求内不可重复；
 - `segments[].cost_per_ms`：单位毫秒成本，有限且非负；
 - `window_start_ms` / `window_end_ms`：参考时间窗（统一时间），起点必须小于终点；
-- `switch_cost`：相邻小区间更换片段 id 的单次成本，有限且非负。
+- `switch_cost`：相邻小区间更换片段 id 的单次成本，有限且非负；
+- `min_run_ms`：可选，有限且非负，默认 `0`（不限制）。每段连续使用同一
+  片段 id 的参考时长（含时间窗首尾两段）不得小于该值；只在片段端点处切换。
 
 ### 成功响应（200）
 
@@ -165,6 +172,42 @@ curl -X POST http://localhost:8000/v1/edit-plan \
 ```
 
 标定失败（秩亏、斜率非正、残差超容限等）时沿用 `/v1/calibrate` 的 422 错误格式。
+
+### 最短时长不可行响应（422）
+
+窗口不存在空档（每个时刻都有片段覆盖），但没有任何方案能让每段连续使用
+同一片段 id 的参考时长都达到 `min_run_ms`（含时间窗首尾段）时，返回 422；
+其 `detail.reason` 固定为 `"min_run_infeasible"`，可与空档响应中的
+`gaps_ms` 字段区分：
+
+```bash
+curl -X POST http://localhost:8000/v1/edit-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "devices": ["A"],
+    "reference_device": "A",
+    "sync_points": [],
+    "tolerance_ms": 0,
+    "segments": [
+      {"id": "s1", "device": "A", "start_ms": 0,   "end_ms": 150, "cost_per_ms": 1.0},
+      {"id": "s2", "device": "A", "start_ms": 150, "end_ms": 300, "cost_per_ms": 1.0}
+    ],
+    "window_start_ms": 0,
+    "window_end_ms": 300,
+    "switch_cost": 0,
+    "min_run_ms": 200
+  }'
+```
+
+```json
+{
+  "detail": {
+    "message": "覆盖充分，但不存在每段连续使用同一片段 id 的参考时长都不少于 200.0 ms 的可行计划（含时间窗首尾段）",
+    "reason": "min_run_infeasible",
+    "min_run_ms": 200.0
+  }
+}
+```
 
 ## 本地开发
 

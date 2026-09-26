@@ -9,6 +9,13 @@
 
 同价时取逐区间 id 序列字典序最小者。任一小区间没有完整覆盖它的片段即
 构成空档，抛出 GapError 并附带合并后的空档范围。
+
+最短时长约束：给定非负 min_run_ms，最终计划中每一段连续使用同一片段 id
+的参考时间长度（含时间窗首尾两段）都不得小于该值。约束在片段端点构成的
+半开区间上全局求解：动态规划以“一次连续使用（run）”为转移单位，枚举
+每个 run 覆盖的连续小区间范围并只接受时长达标的 run，因此不会出现先求
+无约束方案再删除短段的情况。覆盖充分却没有任何达标方案时抛出
+MinRunInfeasibleError，与空档错误区分。
 """
 
 from __future__ import annotations
@@ -56,6 +63,17 @@ class GapError(Exception):
         super().__init__(f"窗口内存在无片段覆盖的空档：{joined}")
 
 
+class MinRunInfeasibleError(Exception):
+    """覆盖充分，但不存在满足最短连续时长约束的可行计划。"""
+
+    def __init__(self, min_run_ms: float) -> None:
+        self.min_run_ms = min_run_ms
+        super().__init__(
+            f"覆盖充分，但不存在每段连续使用同一片段 id 的参考时长都不少于 "
+            f"{min_run_ms} ms 的可行计划（含时间窗首尾段）"
+        )
+
+
 def _merge_ranges(ranges: list[tuple[float, float]]) -> list[tuple[float, float]]:
     """把首尾相接（或重叠）的范围合并成连续范围，输入按起点升序。"""
     merged: list[list[float]] = []
@@ -78,17 +96,59 @@ def _make_item(seg: PlanSegment, start_ms: float, end_ms: float) -> PlanItem:
     )
 
 
+def _offer(
+    slots: list[tuple[float, tuple[str, ...]]],
+    run_id: str,
+    state: tuple[float, tuple[str, ...]],
+) -> None:
+    """在边界状态槽中保留按 (成本, id 序列) 最优的至多两个、末 run id 互异的状态。
+
+    扩展新 run 时只需要“末 run id 不等于待扩展 id”的最优前驱，因此两个
+    id 互异的最优状态足以应对任意排除查询；被淘汰状态在该角色下必被保留
+    状态支配。
+    """
+    for idx, (_, seq) in enumerate(slots):
+        if seq[-1] == run_id:
+            if state < slots[idx]:
+                slots[idx] = state
+                slots.sort()
+            return
+    if len(slots) < 2:
+        slots.append(state)
+        slots.sort()
+    elif state < slots[-1]:
+        slots[-1] = state
+        slots.sort()
+
+
+def _best_excluding(
+    slots: list[tuple[float, tuple[str, ...]]], run_id: str
+) -> tuple[float, tuple[str, ...]] | None:
+    """返回末 run id 不等于 run_id 的最优状态，没有则 None。"""
+    for state in slots:  # slots 已按 (成本, id 序列) 升序
+        if state[1][-1] != run_id:
+            return state
+    return None
+
+
 def build_edit_plan(
     segments: list[PlanSegment],
     window_start_ms: float,
     window_end_ms: float,
     switch_cost: float,
+    min_run_ms: float = 0.0,
 ) -> EditPlan:
-    """求解窗口内总成本最低的片段选择，存在空档时抛 GapError。"""
+    """求解窗口内总成本最低的片段选择。
+
+    存在空档时抛 GapError；覆盖充分但没有满足 min_run_ms 的方案时抛
+    MinRunInfeasibleError。
+    """
     if not window_start_ms < window_end_ms:
         raise ValueError("时间窗起点必须小于终点")
     if switch_cost < 0:
         raise ValueError("切换成本必须非负")
+    if min_run_ms < 0:
+        raise ValueError("最短连续时长必须非负")
 
     # 裁剪到窗口，丢弃与窗口无正长度交集的片段
     clipped: list[tuple[PlanSegment, float, float]] = []
@@ -119,39 +179,61 @@ def build_edit_plan(
 
     ids = [seg.seg_id for seg, _, _ in clipped]
     costs = [seg.cost_per_ms for seg, _, _ in clipped]
-    durations = [b - a for a, b in intervals]
+    n = len(intervals)
 
-    # 动态规划：prev[j] = (最低成本, 同价下字典序最小的逐区间 id 序列)，
-    # 表示处理到当前区间且当前区间选择 clipped[j]。转移时枚举上一区间
-    # 候选，id 不同则加一次 switch_cost；同价保留前缀序列字典序最小者。
-    prev: list[tuple[float, tuple[str, ...]] | None] = [None] * len(clipped)
-    for j in candidates[0]:
-        prev[j] = (durations[0] * costs[j], (ids[j],))
-    for i in range(1, len(intervals)):
-        cur: list[tuple[float, tuple[str, ...]] | None] = [None] * len(clipped)
+    # 每个片段覆盖的首个小区间编号（片段覆盖在区间序列上连续，因此从首个
+    # 覆盖区间到 i 都由它覆盖）
+    first_cell: list[int | None] = [None] * len(clipped)
+    for i, cand in enumerate(candidates):
+        for j in cand:
+            if first_cell[j] is None:
+                first_cell[j] = i
+
+    # 以“一次连续使用同一片段（run）”为单位的动态规划。
+    # at[b] 保存覆盖完前 b 个小区间的最优状态槽（至多两个末 run id 互异的
+    # 状态），状态 = (最低成本, 同价下字典序最小的逐区间 id 序列)。
+    # 枚举在第 i 个小区间收尾的新 run：片段 j 连续覆盖小区间 l..i，该 run
+    # 的参考时长 cuts[i+1]-cuts[l] 必须 >= min_run_ms；前驱取边界 l 上末
+    # run id 与 j 不同的最优状态，再加一次切换成本。首 run 从空状态出发。
+    at: list[list[tuple[float, tuple[str, ...]]]] = [
+        [] for _ in range(n + 1)
+    ]
+    at[0] = [(0.0, ())]
+
+    for i in range(n):
         for j in candidates[i]:
-            best: tuple[float, tuple[str, ...]] | None = None
-            for k in candidates[i - 1]:
-                pk = prev[k]
-                assert pk is not None  # 上一区间的候选必有状态
-                cost = pk[0] + (switch_cost if ids[k] != ids[j] else 0.0)
-                if best is None or cost < best[0] or (cost == best[0] and pk[1] < best[1]):
-                    best = (cost, pk[1])
-            assert best is not None
-            cur[j] = (best[0] + durations[i] * costs[j], best[1] + (ids[j],))
-        prev = cur
+            start_l = first_cell[j]
+            assert start_l is not None
+            for l in range(start_l, i + 1):
+                run_ms = cuts[i + 1] - cuts[l]
+                if run_ms < min_run_ms:
+                    break  # l 越大 run 越短，之后都不可能达标
+                if l == 0:
+                    pred_cost, pred_seq = 0.0, ()
+                else:
+                    pred = _best_excluding(at[l], ids[j])
+                    if pred is None:
+                        continue
+                    pred_cost, pred_seq = pred
+                cost = (
+                    pred_cost
+                    + (switch_cost if l > 0 else 0.0)
+                    + run_ms * costs[j]
+                )
+                seq = pred_seq + (ids[j],) * (i - l + 1)
+                _offer(at[i + 1], ids[j], (cost, seq))
 
-    total_cost, best_seq = min(
-        (state for j in candidates[-1] if (state := prev[j]) is not None),
-        key=lambda state: (state[0], state[1]),
-    )
+    if not at[n]:
+        raise MinRunInfeasibleError(min_run_ms)
+
+    total_cost, best_seq = at[n][0]
 
     # 相邻区间选择同一片段的合并为一个计划项（结果天然按时间升序）
     by_id = {seg.seg_id: seg for seg, _, _ in clipped}
     items: list[PlanItem] = []
     run_id = best_seq[0]
     run_start = intervals[0][0]
-    for i in range(1, len(intervals)):
+    for i in range(1, n):
         if best_seq[i] != run_id:
             items.append(_make_item(by_id[run_id], run_start, intervals[i - 1][1]))
             run_id = best_seq[i]
